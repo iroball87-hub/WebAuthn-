@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Passkey Practice Space (Proper WebAuthn)</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom scrollbar for better look */
+        .passkey-list::-webkit-scrollbar {
+            width: 6px;
+        }
+        .passkey-list::-webkit-scrollbar-thumb {
+            background-color: rgba(100, 116, 139, 0.5); /* Slate 500 */
+            border-radius: 3px;
+        }
+        .passkey-list::-webkit-scrollbar-track {
+            background: transparent;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8 flex flex-col items-center">
+
+    <div class="w-full max-w-2xl bg-white shadow-xl rounded-2xl p-6 sm:p-8">
+        <h1 class="text-3xl font-bold text-gray-900 mb-2 flex items-center">
+            <svg class="w-8 h-8 text-indigo-600 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2v6a2 2 0 01-2 2H9a2 2 0 01-2-2V9a2 2 0 012-2h6zM15 7v2m0 0v2m0 0v2m0 0v2M9 7v2m0 0v2m0 0v2m0 0v2" />
+            </svg>
+            Passkey Practice Space (Proper WebAuthn)
+        </h1>
+        <p class="text-gray-500 mb-6 border-b pb-4">
+            This version uses the **actual WebAuthn API** for passkey management. If you encounter security errors, this is expected in embedded environments.
+        </p>
+
+        <!-- Status and Auth -->
+        <div id="status-area" class="mb-6 p-4 rounded-xl text-sm transition-all duration-300 bg-yellow-100 text-yellow-800 border border-yellow-300">
+            Initializing...
+        </div>
+
+        <!-- Create Passkey Section -->
+        <div class="mb-8 p-6 bg-indigo-50 border border-indigo-200 rounded-xl">
+            <h2 class="text-xl font-semibold text-indigo-800 mb-4">Create a New Passkey</h2>
+            <div class="flex flex-col sm:flex-row gap-4">
+                <input type="text" id="passkey-name" placeholder="Name for this Passkey (e.g., 'Work Laptop')"
+                       class="flex-grow p-3 border border-indigo-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                       maxlength="50">
+                <button id="create-btn" onclick="createPasskey()" disabled
+                        class="px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition duration-150 disabled:bg-indigo-300">
+                    Create Passkey
+                </button>
+            </div>
+            <p class="text-xs text-indigo-600 mt-2">
+                This will trigger your OS/Browser's native security flow.
+            </p>
+        </div>
+
+        <!-- Passkeys List Section -->
+        <h2 class="text-xl font-semibold text-gray-800 mb-4 flex justify-between items-center">
+            Your Registered Passkeys
+            <span id="user-id-display" class="text-xs font-mono text-gray-600 bg-gray-100 px-2 py-1 rounded-full"></span>
+        </h2>
+
+        <div id="passkeys-list" class="passkey-list space-y-3 max-h-96 overflow-y-auto pr-2">
+            <!-- Passkey items will be rendered here -->
+            <p id="no-passkeys-message" class="text-gray-500 italic text-center py-8">No passkeys found. Create one above!</p>
+        </div>
+
+        <!-- Modal for user feedback (in place of alert) -->
+        <div id="feedback-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 hidden items-center justify-center p-4 z-50">
+            <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full transition-all transform scale-100">
+                <h3 id="modal-title" class="text-xl font-bold mb-3 text-gray-800"></h3>
+                <p id="modal-message" class="text-gray-600 mb-4"></p>
+                <button onclick="closeModal()" class="w-full px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition">
+                    OK
+                </button>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Firebase Imports and Logic -->
+    <script type="module">
+        // Firebase Imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            setDoc, 
+            onSnapshot, 
+            collection, 
+            query, 
+            serverTimestamp 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- Globals ---
+        let db;
+        let auth;
+        let userId = null;
+        let appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        let isAuthReady = false;
+        let passkeysMetadata = []; 
+        
+        // Check for WebAuthn capability immediately
+        const isWebAuthnAvailable = () => typeof navigator.credentials !== 'undefined' && typeof navigator.credentials.create === 'function';
+
+        // Use a consistent Relying Party ID. 
+        const getRelyingPartyId = () => {
+            const hostname = window.location.hostname;
+            if (hostname && hostname !== 'localhost' && !hostname.match(/^\d/)) {
+                return hostname;
+            }
+            return 'passkey-practice.app'; 
+        };
+        
+        // Helper function to convert ArrayBuffer to Base64 URL-safe string
+        const arrayBufferToBase64Url = (buffer) => {
+            return btoa(String.fromCharCode.apply(null, new Uint8Array(buffer)))
+                .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        };
+
+        // Helper function to convert Base64 URL-safe string to ArrayBuffer
+        const base64UrlToArrayBuffer = (base64url) => {
+            let base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+            while (base64.length % 4 !== 0) {
+                base64 += '=';
+            }
+            
+            const binary_string = atob(base64);
+            const len = binary_string.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binary_string.charCodeAt(i);
+            }
+            return bytes.buffer;
+        };
+
+        // Helper function for UI feedback
+        const updateStatus = (message, type = 'info') => {
+            const statusArea = document.getElementById('status-area');
+            let classes = {
+                'info': 'bg-yellow-100 text-yellow-800 border-yellow-300',
+                'success': 'bg-green-100 text-green-800 border-green-300',
+                'error': 'bg-red-100 text-red-800 border-red-300'
+            };
+            
+            // Reset and apply new classes
+            statusArea.className = 'mb-6 p-4 rounded-xl text-sm transition-all duration-300 border ' + classes[type];
+            statusArea.innerHTML = message;
+        };
+
+        const showModal = (title, message) => {
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-message').innerHTML = message; 
+            document.getElementById('feedback-modal').classList.remove('hidden');
+            document.getElementById('feedback-modal').classList.add('flex');
+        };
+
+        window.closeModal = () => {
+            document.getElementById('feedback-modal').classList.add('hidden');
+            document.getElementById('feedback-modal').classList.remove('flex');
+        };
+
+        // --- Firebase Initialization and Auth ---
+        try {
+            const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            
+            updateStatus('Authenticating user...');
+
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    isAuthReady = true;
+                    document.getElementById('user-id-display').textContent = `User ID: ${userId.substring(0, 10)}...`;
+                    
+                    if (isWebAuthnAvailable()) {
+                        updateStatus('Authentication successful. Ready for passkey operations.', 'success');
+                        document.getElementById('create-btn').disabled = false;
+                    } else {
+                        const errorMsg = 'WebAuthn API not available. Passkeys require a fully secure (HTTPS) top-level browsing context.';
+                        updateStatus(errorMsg, 'error');
+                        showModal('WebAuthn Not Available', errorMsg);
+                    }
+                    
+                    listenForPasskeys();
+                } else {
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (e) {
+                        isAuthReady = true;
+                        updateStatus(`Authentication failed: ${e.message}`, 'error');
+                        console.error("Auth error:", e);
+                    }
+                }
+            });
+
+        } catch (e) {
+            updateStatus(`Firebase setup failed: ${e.message}`, 'error');
+            console.error("Firebase setup error:", e);
+            isAuthReady = true;
+        }
+
+        // --- Passkey UI Rendering and Firestore Listener ---
+
+        const renderPasskeys = () => {
+            const list = document.getElementById('passkeys-list');
+            list.innerHTML = '';
+            
+            if (passkeysMetadata.length === 0) {
+                document.getElementById('no-passkeys-message').style.display = 'block';
+                return;
+            }
+            document.getElementById('no-passkeys-message').style.display = 'none';
+
+            passkeysMetadata.forEach(passkey => {
+                const lastUsed = passkey.lastUsed ? new Date(passkey.lastUsed.seconds * 1000).toLocaleString() : 'Never';
+
+                const item = document.createElement('div');
+                item.className = 'flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-white border border-gray-200 rounded-xl shadow-sm transition hover:shadow-md';
+                item.innerHTML = `
+                    <div class="flex items-center mb-3 sm:mb-0">
+                        <!-- Passkey Icon -->
+                        <svg class="w-6 h-6 text-green-500 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.007 12.007 0 002.944 12c.002 4.931 3.23 9.428 8.01 10.56a1 1 0 00.102 0c4.78-1.132 8.008-5.629 8.01-10.56a12.007 12.007 0 00-1.388-5.064z" />
+                        </svg>
+                        <div>
+                            <p class="font-semibold text-gray-900">${passkey.name}</p>
+                            <p class="text-xs text-gray-500">ID: <span class="font-mono">${passkey.id.substring(0, 10)}...</span></p>
+                            <p class="text-xs text-gray-500 mt-1">Last Used: ${lastUsed}</p>
+                        </div>
+                    </div>
+                    <button onclick="tryPasskey('${passkey.id}')"
+                            class="px-4 py-2 mt-2 sm:mt-0 bg-green-500 text-white font-semibold rounded-lg shadow-md hover:bg-green-600 transition duration-150 text-sm w-full sm:w-auto">
+                        Try Passkey
+                    </button>
+                `;
+                list.appendChild(item);
+            });
+        };
+
+        const listenForPasskeys = () => {
+            if (!isAuthReady || !userId || !db) return;
+
+            const collectionRef = collection(db, 'artifacts', appId, 'users', userId, 'passkeys');
+            const q = query(collectionRef);
+
+            onSnapshot(q, (snapshot) => {
+                passkeysMetadata = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                // Sort by last used date, newest first
+                passkeysMetadata.sort((a, b) => {
+                    const dateA = a.lastUsed?.seconds || 0;
+                    const dateB = b.lastUsed?.seconds || 0;
+                    return dateB - dateA;
+                });
+                renderPasskeys();
+            }, (error) => {
+                updateStatus(`Error fetching passkeys metadata: ${error.message}`, 'error');
+                console.error("Firestore error:", error);
+            });
+        };
+
+
+        // --- WebAuthn Functions (Credential Creation) ---
+
+        window.createPasskey = async () => {
+            if (!isWebAuthnAvailable()) return;
+
+            const passkeyNameInput = document.getElementById('passkey-name');
+            const passkeyName = passkeyNameInput.value.trim();
+            if (!passkeyName) {
+                showModal('Input Error', 'Please enter a name for your new passkey.');
+                return;
+            }
+            
+            document.getElementById('create-btn').disabled = true;
+            updateStatus('Waiting for OS/Browser security key registration...', 'info');
+
+            try {
+                // 1. Generate challenge and user ID
+                const challenge = new Uint8Array(32);
+                window.crypto.getRandomValues(challenge);
+                const userHandle = new Uint8Array(16);
+                window.crypto.getRandomValues(userHandle);
+
+                const rpId = getRelyingPartyId();
+
+                const publicKeyCredentialCreationOptions = {
+                    rp: { id: rpId, name: 'Passkey Practice App' },
+                    user: {
+                        id: userHandle, 
+                        name: userId, 
+                        displayName: passkeyName,
+                    },
+                    challenge: challenge,
+                    pubKeyCredParams: [
+                        { type: 'public-key', alg: -7 }, 
+                        { type: 'public-key', alg: -257 }
+                    ],
+                    authenticatorSelection: {
+                        authenticatorAttachment: 'platform',
+                        requireResidentKey: true,
+                        userVerification: 'preferred',
+                    },
+                    timeout: 60000,
+                    attestation: 'none'
+                };
+
+                // 2. Call the actual WebAuthn API
+                const credential = await navigator.credentials.create({
+                    publicKey: publicKeyCredentialCreationOptions
+                });
+
+                if (credential) {
+                    const credentialId = arrayBufferToBase64Url(credential.rawId);
+                    
+                    // 3. Save only the metadata to Firestore
+                    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'passkeys', credentialId);
+                    await setDoc(docRef, {
+                        name: passkeyName,
+                        createdAt: serverTimestamp(),
+                        lastUsed: serverTimestamp(),
+                        type: credential.type,
+                        transports: ['internal']
+                    });
+
+                    updateStatus(`Passkey '${passkeyName}' created and saved successfully!`, 'success');
+                    passkeyNameInput.value = '';
+
+                } else {
+                    throw new Error("Credential creation failed or was cancelled unexpectedly.");
+                }
+
+            } catch (error) {
+                let errorMessage;
+                if (error.name === 'NotAllowedError' || error.name === 'SecurityError' || (error.message && error.message.includes('secure context'))) {
+                    errorMessage = `
+                        The operation failed due to browser security policy. <br><br>
+                        <strong>Error Type: ${error.name || 'SecurityError'}</strong>. <br>
+                        This application must be run in a <strong>fully secure (HTTPS) and top-level context</strong> to use WebAuthn.
+                    `;
+                    updateStatus(`WebAuthn Error: ${error.name}. Please check security context.`, 'error');
+                } else {
+                    errorMessage = `An unexpected error occurred: ${error.message}`;
+                    updateStatus(`Passkey creation failed: ${error.message}`, 'error');
+                }
+                
+                showModal('Passkey Operation Failed', errorMessage);
+                console.error("Passkey Creation Error (WebAuthn):", error);
+
+            } finally {
+                document.getElementById('create-btn').disabled = !isWebAuthnAvailable() || !isAuthReady;
+            }
+        };
+
+        // --- WebAuthn Functions (Credential Assertion) ---
+
+        window.tryPasskey = async (credentialId) => {
+            if (!isWebAuthnAvailable()) return;
+            
+            document.getElementById('create-btn').disabled = true;
+            updateStatus('Waiting for OS/Browser passkey authentication...', 'info');
+            
+            try {
+                // 1. Generate a challenge
+                const challenge = new Uint8Array(32);
+                window.crypto.getRandomValues(challenge);
+                
+                const rpId = getRelyingPartyId(); 
+                const rawCredentialId = base64UrlToArrayBuffer(credentialId);
+
+                const publicKeyCredentialRequestOptions = {
+                    challenge: challenge,
+                    rpId: rpId,
+                    timeout: 60000,
+                    userVerification: 'preferred',
+                    allowCredentials: [{
+                        id: rawCredentialId, 
+                        type: 'public-key',
+                        transports: ['internal']
+                    }],
+                };
+
+                // 2. Call the actual WebAuthn API
+                const assertion = await navigator.credentials.get({
+                    publicKey: publicKeyCredentialRequestOptions
+                });
+
+                if (assertion) {
+                    // 3. Update the metadata in Firestore
+                    const docRef = doc(db, 'artifacts', appId, 'users', userId, 'passkeys', credentialId);
+                    await setDoc(docRef, { lastUsed: serverTimestamp() }, { merge: true });
+
+                    updateStatus(`Passkey assertion successful! You are signed in.`, 'success');
+                    showModal('Passkey Success', 'The passkey was successfully used to log in (assertion successful).');
+                    
+                } else {
+                    throw new Error("Assertion failed or was cancelled unexpectedly.");
+                }
+
+            } catch (error) {
+                let errorMessage;
+                if (error.name === 'NotAllowedError' || error.name === 'SecurityError' || (error.message && error.message.includes('secure context'))) {
+                    errorMessage = `
+                        The operation failed due to browser security policy. <br><br>
+                        <strong>Error Type: ${error.name || 'SecurityError'}</strong>. <br>
+                        This application must be run in a <strong>fully secure (HTTPS) and top-level context</strong> to use WebAuthn.
+                    `;
+                    updateStatus(`WebAuthn Error: ${error.name}. Please check security context.`, 'error');
+                } else {
+                    errorMessage = `An unexpected error occurred: ${error.message}`;
+                    updateStatus(`Passkey usage failed: ${error.message}`, 'error');
+                }
+
+                showModal('Passkey Operation Failed', errorMessage);
+                console.error("Passkey Assertion Error (WebAuthn):", error);
+            } finally {
+                document.getElementById('create-btn').disabled = !isWebAuthnAvailable() || !isAuthReady;
+            }
+        };
+
+        // Expose functions to the global scope
+        window.createPasskey = createPasskey;
+        window.tryPasskey = tryPasskey;
+
+    </script>
+</body>
+</html>
+
